@@ -1,0 +1,14 @@
+node_modules/
+dist/
+drizzle/
+data/*
+!data/.gitkeep
+.env
+*.log
+logs/
+tmp/*
+!tmp/.gitkeep
+.DS_Store
+Thumbs.db
+docker/data/
+docker/.env

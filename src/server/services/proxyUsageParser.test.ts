@@ -1,0 +1,120 @@
+import { describe, expect, it } from 'vitest';
+import {
+  mergeProxyUsage,
+  parseProxyUsage,
+  pullSseDataEvents,
+} from './proxyUsageParser.js';
+
+describe('proxyUsageParser', () => {
+  it('parses standard OpenAI usage fields', () => {
+    const usage = parseProxyUsage({
+      usage: {
+        prompt_tokens: 123,
+        completion_tokens: 45,
+        total_tokens: 168,
+      },
+    });
+
+    expect(usage).toEqual({
+      promptTokens: 123,
+      completionTokens: 45,
+      totalTokens: 168,
+    });
+  });
+
+  it('parses input/output token style usage fields', () => {
+    const usage = parseProxyUsage({
+      usage: {
+        input_tokens: 80,
+        output_tokens: 20,
+      },
+    });
+
+    expect(usage).toEqual({
+      promptTokens: 80,
+      completionTokens: 20,
+      totalTokens: 100,
+    });
+  });
+
+  it('parses Gemini usageMetadata shape', () => {
+    const usage = parseProxyUsage({
+      usageMetadata: {
+        promptTokenCount: 12,
+        candidatesTokenCount: 34,
+        totalTokenCount: 46,
+      },
+    });
+
+    expect(usage).toEqual({
+      promptTokens: 12,
+      completionTokens: 34,
+      totalTokens: 46,
+    });
+  });
+
+  it('parses deeply nested usage payloads', () => {
+    const usage = parseProxyUsage({
+      data: {
+        result: {
+          response: {
+            usage: {
+              prompt_tokens: 210,
+              completion_tokens: 40,
+              total_tokens: 250,
+            },
+          },
+        },
+      },
+    });
+
+    expect(usage).toEqual({
+      promptTokens: 210,
+      completionTokens: 40,
+      totalTokens: 250,
+    });
+  });
+
+  it('falls back to usage detail objects when aggregate fields are absent', () => {
+    const usage = parseProxyUsage({
+      usage: {
+        prompt_tokens_details: {
+          text_tokens: 7,
+          cached_tokens: 3,
+        },
+        completion_tokens_details: {
+          reasoning_tokens: 20,
+        },
+      },
+    });
+
+    expect(usage).toEqual({
+      promptTokens: 10,
+      completionTokens: 20,
+      totalTokens: 30,
+    });
+  });
+
+  it('merges usage snapshots by keeping richer values', () => {
+    const merged = mergeProxyUsage(
+      { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      { promptTokens: 90, completionTokens: 30, totalTokens: 120 },
+    );
+
+    expect(merged).toEqual({
+      promptTokens: 90,
+      completionTokens: 30,
+      totalTokens: 120,
+    });
+  });
+
+  it('pulls SSE data events across chunk boundaries', () => {
+    const first = pullSseDataEvents('data: {"a":1}\n\ndata: {"b":');
+    expect(first.events).toEqual(['{"a":1}']);
+    expect(first.rest).toBe('data: {"b":');
+
+    const second = pullSseDataEvents(`${first.rest}2}\n\ndata: [DONE]\n\n`);
+    expect(second.events).toEqual(['{"b":2}']);
+    expect(second.rest).toBe('');
+  });
+});

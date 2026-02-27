@@ -1,0 +1,567 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { api } from '../api.js';
+import { useToast } from '../components/Toast.js';
+import { formatDateTimeLocal } from './helpers/checkinLogTime.js';
+import ModernSelect from '../components/ModernSelect.js';
+import { getAccountsAddPanelStyle } from './helpers/accountsPanelStyle.js';
+import { tr } from '../i18n.js';
+
+type SyncStatus = 'success' | 'skipped' | 'failed';
+
+type AccountTokenSyncResult = {
+  status?: string;
+  success?: boolean;
+  synced?: boolean;
+  message?: string;
+  created?: number;
+  updated?: number;
+  accountId?: number;
+  accountName?: string;
+  account?: {
+    id?: number;
+    username?: string;
+  };
+};
+
+const isAccountSyncable = (account: any) =>
+  account?.status === 'active' && account?.site?.status !== 'disabled';
+
+const resolveSyncStatus = (result: AccountTokenSyncResult | null | undefined): SyncStatus => {
+  const raw = String(result?.status || '').toLowerCase();
+  if (raw === 'failed' || raw === 'error') return 'failed';
+  if (raw === 'skipped' || raw === 'skip') return 'skipped';
+  if (raw === 'success' || raw === 'ok' || raw === 'succeeded') return 'success';
+  if (result?.success === false) return 'failed';
+  if (result?.synced === false) return 'skipped';
+  return 'success';
+};
+
+const resolveSyncMessage = (result: AccountTokenSyncResult | null | undefined, fallback: string) => {
+  const message = typeof result?.message === 'string' ? result.message.trim() : '';
+  return message || fallback;
+};
+
+const resolveAccountLabel = (result: AccountTokenSyncResult | null | undefined) => {
+  const name = typeof result?.accountName === 'string' ? result.accountName.trim() : '';
+  if (name) return name;
+  const username = typeof result?.account?.username === 'string' ? result.account.username.trim() : '';
+  if (username) return username;
+  const accountId = result?.accountId ?? result?.account?.id;
+  if (accountId) return `#${accountId}`;
+  return '未知账号';
+};
+
+async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
+export default function Tokens() {
+  const initialCreateForm = {
+    accountId: 0,
+    name: '',
+    group: 'default',
+    unlimitedQuota: true,
+    remainQuota: '',
+    expiredTime: '',
+    allowIps: '',
+  };
+
+  const [tokens, setTokens] = useState<any[]>([]);
+  const [accounts, setAccounts] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [syncingAccountId, setSyncingAccountId] = useState(0);
+  const [syncing, setSyncing] = useState(false);
+  const [syncingAll, setSyncingAll] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [rowLoading, setRowLoading] = useState<Record<string, boolean>>({});
+  const [form, setForm] = useState(initialCreateForm);
+  const [groupOptions, setGroupOptions] = useState<string[]>(['default']);
+  const [groupLoading, setGroupLoading] = useState(false);
+  const toast = useToast();
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [tokenRows, accountRows] = await Promise.all([api.getAccountTokens(), api.getAccounts()]);
+      setTokens(tokenRows || []);
+      const latestAccounts = accountRows || [];
+      setAccounts(latestAccounts);
+
+      const syncableAccounts = latestAccounts.filter(isAccountSyncable);
+      const hasCurrentSelected = syncableAccounts.some((account) => account.id === syncingAccountId);
+      if (!hasCurrentSelected) {
+        setSyncingAccountId(syncableAccounts[0]?.id || 0);
+      }
+    } catch (e: any) {
+      toast.error(e.message || '加载令牌失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  useEffect(() => {
+    if (!showAdd || !form.accountId) {
+      setGroupLoading(false);
+      setGroupOptions(['default']);
+      return;
+    }
+
+    let cancelled = false;
+    setGroupLoading(true);
+    api.getAccountTokenGroups(form.accountId)
+      .then((res: any) => {
+        if (cancelled) return;
+        const groups = Array.isArray(res?.groups)
+          ? res.groups.map((item: any) => String(item || '').trim()).filter(Boolean)
+          : [];
+        const normalized = Array.from(new Set(groups));
+        const nextOptions = normalized.length > 0 ? normalized : ['default'];
+        setGroupOptions(nextOptions);
+        setForm((prev) => {
+          if (nextOptions.includes(prev.group)) return prev;
+          return { ...prev, group: nextOptions[0] };
+        });
+      })
+      .catch((error: any) => {
+        if (cancelled) return;
+        setGroupOptions(['default']);
+        setForm((prev) => ({ ...prev, group: 'default' }));
+        toast.error(error?.message || '拉取分组失败，已回退 default');
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setGroupLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showAdd, form.accountId]);
+
+  const activeAccounts = useMemo(() => accounts.filter(isAccountSyncable), [accounts]);
+
+  const withRowLoading = async (key: string, fn: () => Promise<void>) => {
+    setRowLoading((prev) => ({ ...prev, [key]: true }));
+    try {
+      await fn();
+    } finally {
+      setRowLoading((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const handleCopyToken = async (tokenId: number, tokenName: string) => {
+    await withRowLoading(`token-${tokenId}-copy`, async () => {
+      const res = await api.getAccountTokenValue(tokenId);
+      const tokenValue = (res?.token || '').trim();
+      if (!tokenValue) {
+        toast.error('令牌为空，无法复制');
+        return;
+      }
+
+      await copyText(tokenValue);
+      toast.success(`已复制令牌：${tokenName || `token-${tokenId}`}`);
+    });
+  };
+
+  const handleAddToken = async () => {
+    if (!form.accountId) return;
+    if (!form.unlimitedQuota) {
+      const remainQuota = Number.parseInt(form.remainQuota, 10);
+      if (!Number.isFinite(remainQuota) || remainQuota <= 0) {
+        toast.error('有限额度令牌请填写正整数额度');
+        return;
+      }
+    }
+    setSaving(true);
+    try {
+      const remainQuota = form.unlimitedQuota
+        ? undefined
+        : Number.parseInt(form.remainQuota, 10);
+      await api.addAccountToken({
+        accountId: form.accountId,
+        name: form.name,
+        group: form.group || 'default',
+        unlimitedQuota: form.unlimitedQuota,
+        remainQuota,
+        expiredTime: form.expiredTime || undefined,
+        allowIps: form.allowIps,
+      });
+      toast.success('已在站点创建并同步令牌');
+      setForm(initialCreateForm);
+      setShowAdd(false);
+      await load();
+    } catch (e: any) {
+      toast.error(e.message || '创建令牌失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSync = async () => {
+    if (!syncingAccountId) return;
+    setSyncing(true);
+    try {
+      const res = await api.syncAccountTokens(syncingAccountId) as AccountTokenSyncResult;
+      const status = resolveSyncStatus(res);
+      if (status === 'failed') {
+        toast.error(`同步失败：${resolveSyncMessage(res, '请检查账号令牌或站点状态')}`);
+      } else if (status === 'skipped') {
+        toast.info(`同步已跳过：${resolveSyncMessage(res, '账号缺少可用会话令牌')}`);
+      } else {
+        toast.success(`同步完成：新增 ${res.created || 0}，更新 ${res.updated || 0}`);
+      }
+      await load();
+    } catch (e: any) {
+      toast.error(e.message || '同步令牌失败');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleSyncAll = async () => {
+    setSyncingAll(true);
+    try {
+      const res = await api.syncAllAccountTokens();
+      if (res?.queued) {
+        toast.info(res.message || '已开始同步令牌，请稍后查看日志');
+        await load();
+        return;
+      }
+
+      const syncResults = (
+        Array.isArray(res?.results) ? res.results
+          : Array.isArray(res?.items) ? res.items
+            : Array.isArray(res?.accounts) ? res.accounts
+              : []
+      ) as AccountTokenSyncResult[];
+
+      if (syncResults.length === 0) {
+        const status = resolveSyncStatus(res as AccountTokenSyncResult);
+        if (status === 'failed') {
+          toast.error(`全部同步失败：${resolveSyncMessage(res, '请稍后重试')}`);
+        } else if (status === 'skipped') {
+          toast.info(`全部同步已跳过：${resolveSyncMessage(res, '没有可同步的账号')}`);
+        } else {
+          toast.success('全部账号同步完成');
+        }
+      } else {
+        const failedRows = syncResults.filter((item) => resolveSyncStatus(item) === 'failed');
+        const skippedRows = syncResults.filter((item) => resolveSyncStatus(item) === 'skipped');
+        const successRows = syncResults.filter((item) => resolveSyncStatus(item) === 'success');
+
+        toast.success(`全部同步完成：成功 ${successRows.length}，跳过 ${skippedRows.length}，失败 ${failedRows.length}`);
+
+        failedRows.slice(0, 3).forEach((item) => {
+          toast.error(`${resolveAccountLabel(item)} 同步失败：${resolveSyncMessage(item, '请检查账号配置')}`);
+        });
+        skippedRows.slice(0, 3).forEach((item) => {
+          toast.info(`${resolveAccountLabel(item)} 已跳过：${resolveSyncMessage(item, '不满足同步条件')}`);
+        });
+
+        if (failedRows.length > 3) {
+          toast.error(`另有 ${failedRows.length - 3} 个失败账号，请查看日志`);
+        }
+        if (skippedRows.length > 3) {
+          toast.info(`另有 ${skippedRows.length - 3} 个跳过账号，请查看日志`);
+        }
+      }
+
+      await load();
+    } catch (e: any) {
+      toast.error(e.message || '全部同步失败');
+    } finally {
+      setSyncingAll(false);
+    }
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%',
+    padding: '10px 14px',
+    border: '1px solid var(--color-border)',
+    borderRadius: 'var(--radius-sm)',
+    fontSize: 13,
+    outline: 'none',
+    background: 'var(--color-bg)',
+    color: 'var(--color-text-primary)',
+  };
+
+  return (
+    <div className="animate-fade-in">
+      <div className="page-header">
+        <h2 className="page-title">{tr('令牌管理')}</h2>
+        <div className="page-actions">
+          <div style={{ minWidth: 220, position: 'relative', zIndex: 20 }}>
+            <ModernSelect
+              size="sm"
+              value={String(syncingAccountId || 0)}
+              onChange={(nextValue) => setSyncingAccountId(Number.parseInt(nextValue, 10) || 0)}
+              options={[
+                { value: '0', label: '选择账号后同步站点令牌' },
+                ...activeAccounts.map((account) => ({
+                  value: String(account.id),
+                  label: `${account.username || `account-${account.id}`} @ ${account.site?.name || '-'}`,
+                })),
+              ]}
+              placeholder="选择账号后同步站点令牌"
+            />
+          </div>
+          <button
+            onClick={handleSync}
+            disabled={syncing || syncingAll || !syncingAccountId}
+            className="btn btn-ghost"
+            style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
+          >
+            {syncing ? <><span className="spinner spinner-sm" /> 同步中...</> : '同步站点令牌'}
+          </button>
+          <button
+            onClick={handleSyncAll}
+            disabled={syncing || syncingAll || activeAccounts.length === 0}
+            className="btn btn-ghost"
+            style={{ border: '1px solid var(--color-border)', padding: '8px 14px' }}
+          >
+            {syncingAll ? <><span className="spinner spinner-sm" /> 同步中...</> : '同步全部账号'}
+          </button>
+          <button onClick={() => setShowAdd((prev) => !prev)} className="btn btn-primary">
+            {showAdd ? '取消' : '+ 新增令牌'}
+          </button>
+        </div>
+      </div>
+
+      <div className="info-tip" style={{ marginBottom: 12 }}>
+        新增令牌会调用站点 API 创建新密钥，再自动同步到本地。支持设置分组、额度、过期时间和 IP 白名单；已存在密钥可直接用“同步站点令牌”读取。
+      </div>
+
+      {showAdd && (
+        <div className="card animate-scale-in" style={getAccountsAddPanelStyle()}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div style={{ gridColumn: '1 / span 2' }}>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>所属账号</div>
+              <ModernSelect
+                value={String(form.accountId || 0)}
+                onChange={(nextValue) => {
+                  setForm((prev) => ({
+                    ...prev,
+                    accountId: Number.parseInt(nextValue, 10) || 0,
+                    group: '',
+                  }));
+                }}
+                options={[
+                  { value: '0', label: '选择账号' },
+                  ...activeAccounts.map((account) => ({
+                    value: String(account.id),
+                    label: `${account.username || `account-${account.id}`} @ ${account.site?.name || '-'}`,
+                  })),
+                ]}
+                placeholder="选择账号"
+              />
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>令牌名称（可选）</div>
+              <input
+                value={form.name}
+                onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
+                placeholder="例如 metapi"
+                style={inputStyle}
+              />
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>分组</div>
+              <ModernSelect
+                value={form.group || ''}
+                onChange={(nextValue) => setForm((prev) => ({ ...prev, group: nextValue }))}
+                options={(groupOptions.length > 0 ? groupOptions : ['default']).map((group) => ({
+                  value: group,
+                  label: group,
+                }))}
+                placeholder={groupLoading ? '分组加载中...' : '选择分组'}
+                disabled={!form.accountId || groupLoading}
+              />
+            </div>
+            <div style={{ gridColumn: '1 / span 2', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)' }}>
+                <input
+                  type="checkbox"
+                  checked={form.unlimitedQuota}
+                  onChange={(e) => setForm((prev) => ({ ...prev, unlimitedQuota: e.target.checked }))}
+                />
+                不限额度
+              </label>
+              {!form.unlimitedQuota && (
+                <input
+                  value={form.remainQuota}
+                  onChange={(e) => setForm((prev) => ({ ...prev, remainQuota: e.target.value.replace(/[^\d]/g, '') }))}
+                  placeholder="额度（正整数）"
+                  style={{ ...inputStyle, maxWidth: 220 }}
+                />
+              )}
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>过期时间（可选）</div>
+              <input
+                type="datetime-local"
+                value={form.expiredTime}
+                onChange={(e) => setForm((prev) => ({ ...prev, expiredTime: e.target.value }))}
+                style={inputStyle}
+              />
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>IP 白名单（可选）</div>
+              <input
+                value={form.allowIps}
+                onChange={(e) => setForm((prev) => ({ ...prev, allowIps: e.target.value }))}
+                placeholder="多个用英文逗号分隔"
+                style={inputStyle}
+              />
+            </div>
+            <div style={{ gridColumn: '1 / span 2', display: 'flex', alignItems: 'center', fontSize: 12, color: 'var(--color-text-muted)' }}>
+              将在选中账号所属站点直接创建新密钥
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <button
+              onClick={handleAddToken}
+              disabled={saving || !form.accountId}
+              className="btn btn-primary"
+            >
+              {saving ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 创建中...</> : '创建并同步令牌'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="card" style={{ overflowX: 'auto' }}>
+        {loading ? (
+          <div style={{ padding: 20 }}>
+            <div className="skeleton" style={{ width: '100%', height: 34, marginBottom: 8 }} />
+            <div className="skeleton" style={{ width: '100%', height: 34, marginBottom: 8 }} />
+            <div className="skeleton" style={{ width: '100%', height: 34 }} />
+          </div>
+        ) : tokens.length > 0 ? (
+          <table className="data-table token-table">
+            <thead>
+              <tr>
+                <th>令牌名称</th>
+                <th>令牌值</th>
+                <th>来源站点</th>
+                <th>账号</th>
+                <th>状态</th>
+                <th>默认</th>
+                <th>更新时间</th>
+                <th className="token-table-actions-col" style={{ textAlign: 'right' }}>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tokens.map((token: any, i: number) => {
+                const loadingPrefix = `token-${token.id}`;
+                return (
+                  <tr key={token.id} className={`animate-slide-up stagger-${Math.min(i + 1, 5)}`}>
+                    <td style={{ fontWeight: 600 }}>{token.name || '-'}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{token.tokenMasked || '***'}</td>
+                    <td>
+                      {token.site?.url ? (
+                        <a
+                          href={token.site.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="badge-link"
+                        >
+                          <span className="badge badge-muted" style={{ fontSize: 11 }}>
+                            {token.site?.name || 'unknown'}
+                          </span>
+                        </a>
+                      ) : (
+                        <span className="badge badge-muted" style={{ fontSize: 11 }}>
+                          {token.site?.name || 'unknown'}
+                        </span>
+                      )}
+                    </td>
+                    <td>{token.account?.username || `account-${token.accountId}`}</td>
+                    <td>
+                      <span className={`badge ${token.enabled ? 'badge-success' : 'badge-muted'}`} style={{ fontSize: 11 }}>
+                        {token.enabled ? '启用' : '禁用'}
+                      </span>
+                    </td>
+                    <td>{token.isDefault ? <span className="badge badge-warning" style={{ fontSize: 11 }}>默认</span> : '-'}</td>
+                    <td style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{formatDateTimeLocal(token.updatedAt)}</td>
+                    <td className="token-table-actions-col" style={{ textAlign: 'right' }}>
+                      <div className="token-table-actions">
+                        {!token.isDefault && (
+                          <button
+                            onClick={() => withRowLoading(`${loadingPrefix}-default`, async () => {
+                              await api.setDefaultAccountToken(token.id);
+                              toast.success('默认令牌已更新');
+                              await load();
+                            })}
+                            disabled={!!rowLoading[`${loadingPrefix}-default`]}
+                            className="btn btn-link btn-link-info token-table-action-btn"
+                          >
+                            {rowLoading[`${loadingPrefix}-default`] ? <span className="spinner spinner-sm" /> : '设默认'}
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleCopyToken(token.id, token.name || '')}
+                          disabled={!!rowLoading[`${loadingPrefix}-copy`]}
+                          className="btn btn-link btn-link-primary token-table-action-btn"
+                        >
+                          {rowLoading[`${loadingPrefix}-copy`] ? <span className="spinner spinner-sm" /> : '复制'}
+                        </button>
+                        <button
+                          onClick={() => withRowLoading(`${loadingPrefix}-toggle`, async () => {
+                            await api.updateAccountToken(token.id, { enabled: !token.enabled });
+                            toast.success(token.enabled ? '令牌已禁用' : '令牌已启用');
+                            await load();
+                          })}
+                          disabled={!!rowLoading[`${loadingPrefix}-toggle`]}
+                          className={`btn btn-link ${token.enabled ? 'btn-link-warning' : 'btn-link-primary'} token-table-action-btn`}
+                        >
+                          {rowLoading[`${loadingPrefix}-toggle`] ? <span className="spinner spinner-sm" /> : (token.enabled ? '禁用' : '启用')}
+                        </button>
+                        <button
+                          onClick={() => withRowLoading(`${loadingPrefix}-delete`, async () => {
+                            await api.deleteAccountToken(token.id);
+                            toast.success('令牌已删除');
+                            await load();
+                          })}
+                          disabled={!!rowLoading[`${loadingPrefix}-delete`]}
+                          className="btn btn-link btn-link-danger token-table-action-btn"
+                        >
+                          {rowLoading[`${loadingPrefix}-delete`] ? <span className="spinner spinner-sm" /> : '删除'}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        ) : (
+          <div className="empty-state">
+            <svg className="empty-state-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" /></svg>
+            <div className="empty-state-title">暂无令牌</div>
+            <div className="empty-state-desc">可先同步站点令牌，或直接在站点创建新令牌。</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

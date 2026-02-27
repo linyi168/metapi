@@ -1,0 +1,57 @@
+import { FastifyInstance } from 'fastify';
+import { db, schema } from '../../db/index.js';
+import { and, eq } from 'drizzle-orm';
+import { refreshModelsAndRebuildRoutes } from '../../services/modelService.js';
+
+export async function modelsProxyRoute(app: FastifyInstance) {
+  app.get('/v1/models', async (request) => {
+    const readModels = () => {
+      const rows = db.select({ modelName: schema.modelAvailability.modelName })
+        .from(schema.modelAvailability)
+        .innerJoin(schema.accounts, eq(schema.modelAvailability.accountId, schema.accounts.id))
+        .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+        .where(
+          and(
+            eq(schema.modelAvailability.available, true),
+            eq(schema.accounts.status, 'active'),
+            eq(schema.sites.status, 'active'),
+          ),
+        )
+        .all();
+      return Array.from(new Set(rows.map((r) => r.modelName))).sort();
+    };
+
+    let models = readModels();
+    if (models.length === 0) {
+      await refreshModelsAndRebuildRoutes();
+      models = readModels();
+    }
+
+    const wantsClaudeFormat = typeof request.headers['anthropic-version'] === 'string'
+      || typeof request.headers['x-api-key'] === 'string';
+    if (wantsClaudeFormat) {
+      const data = models.map((id) => ({
+        id,
+        type: 'model',
+        display_name: id,
+        created_at: new Date().toISOString(),
+      }));
+      return {
+        data,
+        first_id: data[0]?.id || null,
+        last_id: data[data.length - 1]?.id || null,
+        has_more: false,
+      };
+    }
+
+    return {
+      object: 'list',
+      data: models.map(id => ({
+        id,
+        object: 'model',
+        created: Math.floor(Date.now() / 1000),
+        owned_by: 'metapi',
+      })),
+    };
+  });
+}

@@ -1,0 +1,185 @@
+import Fastify, { type FastifyInstance } from 'fastify';
+import { describe, expect, it, beforeAll, beforeEach, afterAll } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import {
+  formatLocalDate,
+  formatUtcSqlDateTime,
+  getLocalDayRangeUtc,
+  parseStoredUtcDateTime,
+} from '../../services/localTimeService.js';
+
+type DbModule = typeof import('../../db/index.js');
+
+describe('accounts api today reward fallback', () => {
+  let app: FastifyInstance;
+  let db: DbModule['db'];
+  let schema: DbModule['schema'];
+  let dataDir = '';
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'metapi-accounts-reward-fallback-'));
+    process.env.DATA_DIR = dataDir;
+
+    await import('../../db/migrate.js');
+    const dbModule = await import('../../db/index.js');
+    const routesModule = await import('./accounts.js');
+    db = dbModule.db;
+    schema = dbModule.schema;
+
+    app = Fastify();
+    await app.register(routesModule.accountsRoutes);
+  });
+
+  beforeEach(() => {
+    db.delete(schema.proxyLogs).run();
+    db.delete(schema.checkinLogs).run();
+    db.delete(schema.routeChannels).run();
+    db.delete(schema.tokenRoutes).run();
+    db.delete(schema.tokenModelAvailability).run();
+    db.delete(schema.modelAvailability).run();
+    db.delete(schema.accountTokens).run();
+    db.delete(schema.accounts).run();
+    db.delete(schema.sites).run();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    delete process.env.DATA_DIR;
+  });
+
+  it('uses today income value when checkin reward is missing', async () => {
+    const today = formatLocalDate(new Date());
+    const site = db.insert(schema.sites).values({
+      name: 'reward-site',
+      url: 'https://reward-site.example.com',
+      platform: 'new-api',
+    }).returning().get();
+    const account = db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'reward-user',
+      accessToken: 'token',
+      status: 'active',
+      extraConfig: JSON.stringify({
+        todayIncomeSnapshot: {
+          day: today,
+          baseline: 12.5,
+          latest: 12.5,
+          updatedAt: `${today}T10:00:00.000Z`,
+        },
+      }),
+    }).returning().get();
+
+    db.insert(schema.checkinLogs).values({
+      accountId: account.id,
+      status: 'success',
+      message: 'checked in',
+      reward: '',
+      createdAt: `${today} 10:01:00`,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/accounts',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const rows = response.json() as Array<{ id: number; todayReward: number }>;
+    const target = rows.find((row) => row.id === account.id);
+    expect(target?.todayReward).toBe(12.5);
+  });
+
+  it('prefers parsed checkin reward when available', async () => {
+    const today = formatLocalDate(new Date());
+    const site = db.insert(schema.sites).values({
+      name: 'reward-site',
+      url: 'https://reward-site.example.com',
+      platform: 'new-api',
+    }).returning().get();
+    const account = db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'reward-user',
+      accessToken: 'token',
+      status: 'active',
+      extraConfig: JSON.stringify({
+        todayIncomeSnapshot: {
+          day: today,
+          baseline: 10,
+          latest: 14,
+          updatedAt: `${today}T10:00:00.000Z`,
+        },
+      }),
+    }).returning().get();
+
+    db.insert(schema.checkinLogs).values({
+      accountId: account.id,
+      status: 'success',
+      message: 'checkin success',
+      reward: '1.2',
+      createdAt: `${today} 10:01:00`,
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/accounts',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const rows = response.json() as Array<{ id: number; todayReward: number }>;
+    const target = rows.find((row) => row.id === account.id);
+    expect(target?.todayReward).toBe(1.2);
+  });
+
+  it('counts today spend only inside local-day range', async () => {
+    const site = db.insert(schema.sites).values({
+      name: 'spend-site',
+      url: 'https://spend-site.example.com',
+      platform: 'new-api',
+    }).returning().get();
+    const account = db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'spend-user',
+      accessToken: 'token',
+      status: 'active',
+    }).returning().get();
+
+    const { startUtc, endUtc } = getLocalDayRangeUtc();
+    const startDate = parseStoredUtcDateTime(startUtc)!;
+    const endDate = parseStoredUtcDateTime(endUtc)!;
+    const beforeStart = formatUtcSqlDateTime(new Date(startDate.getTime() - 60_000));
+    const inRange = formatUtcSqlDateTime(new Date(startDate.getTime() + 60_000));
+    const afterEnd = formatUtcSqlDateTime(new Date(endDate.getTime() + 60_000));
+
+    db.insert(schema.proxyLogs).values([
+      {
+        accountId: account.id,
+        status: 'success',
+        estimatedCost: 1,
+        createdAt: beforeStart,
+      },
+      {
+        accountId: account.id,
+        status: 'success',
+        estimatedCost: 2,
+        createdAt: inRange,
+      },
+      {
+        accountId: account.id,
+        status: 'success',
+        estimatedCost: 4,
+        createdAt: afterEnd,
+      },
+    ]).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/accounts',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const rows = response.json() as Array<{ id: number; todaySpend: number }>;
+    const target = rows.find((row) => row.id === account.id);
+    expect(target?.todaySpend).toBe(2);
+  });
+});

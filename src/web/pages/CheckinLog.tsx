@@ -1,0 +1,226 @@
+import { useEffect, useState } from 'react';
+import { api } from '../api.js';
+import { useToast } from '../components/Toast.js';
+import { formatCheckinLogTime } from './helpers/checkinLogTime.js';
+import { tr } from '../i18n.js';
+
+type LogFilter = 'all' | 'success' | 'failed' | 'skipped';
+
+type FailureReason = {
+  code: string;
+  category: string;
+  title: string;
+  actionHint: string;
+  detailHint: string;
+};
+
+export default function CheckinLog() {
+  const [logs, setLogs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [triggering, setTriggering] = useState(false);
+  const [filter, setFilter] = useState<LogFilter>('all');
+  const toast = useToast();
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const data = await api.getCheckinLogs('limit=100');
+      setLogs(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      toast.error(e.message || '加载签到记录失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const handleTriggerAll = async () => {
+    setTriggering(true);
+    try {
+      const res = await api.triggerCheckinAll();
+      if (res?.queued) {
+        toast.info(res.message || '已开始签到，请稍后查看签到记录');
+      } else {
+        toast.success(res?.message || '签到已执行');
+      }
+      await load();
+    } catch (e: any) {
+      toast.error(e.message || '触发签到失败');
+    } finally {
+      setTriggering(false);
+    }
+  };
+
+  const getStatus = (log: any): 'success' | 'failed' | 'skipped' => {
+    const raw = (log.checkin_logs?.status || log.status || 'failed') as string;
+    if (raw === 'success' || raw === 'skipped') return raw;
+    return 'failed';
+  };
+
+  const filtered = filter === 'all' ? logs : logs.filter((log) => getStatus(log) === filter);
+
+  const countBy = (target: Exclude<LogFilter, 'all'>) => logs.filter((log) => getStatus(log) === target).length;
+
+  const statusLabel = (status: 'success' | 'failed' | 'skipped') => {
+    if (status === 'success') return '成功';
+    if (status === 'skipped') return '跳过';
+    return '失败';
+  };
+
+  const statusClass = (status: 'success' | 'failed' | 'skipped') => {
+    if (status === 'success') return 'badge-success';
+    if (status === 'skipped') return 'badge-muted';
+    return 'badge-error';
+  };
+
+  const getFailureReason = (log: any): FailureReason | null => {
+    const reason = log.failureReason as FailureReason | undefined;
+    if (!reason || !reason.code) return null;
+    return reason;
+  };
+
+  return (
+    <div className="animate-fade-in">
+      <div className="page-header">
+        <h2 className="page-title">{tr('签到记录')}</h2>
+        <button
+          onClick={handleTriggerAll}
+          disabled={triggering}
+          className="btn btn-soft-primary"
+        >
+          {triggering ? (
+            <>
+              <span className="spinner spinner-sm" />
+              触发中...
+            </>
+          ) : (
+            '运行所有签到'
+          )}
+        </button>
+      </div>
+
+      <div className="tabs" style={{ marginBottom: 0 }}>
+        {(['all', 'success', 'failed', 'skipped'] as const).map((tab) => (
+          <button key={tab} className={`tab ${filter === tab ? 'active' : ''}`} onClick={() => setFilter(tab)}>
+            {tab === 'all' && `全部 (${logs.length})`}
+            {tab === 'success' && `成功 (${countBy('success')})`}
+            {tab === 'failed' && `失败 (${countBy('failed')})`}
+            {tab === 'skipped' && `跳过 (${countBy('skipped')})`}
+          </button>
+        ))}
+      </div>
+
+      <div className="card" style={{ overflowX: 'auto', borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
+        {loading ? (
+          <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {[...Array(5)].map((_, i) => (
+              <div key={i} style={{ display: 'flex', gap: 16 }}>
+                <div className="skeleton" style={{ width: 120, height: 16 }} />
+                <div className="skeleton" style={{ width: 80, height: 16 }} />
+                <div className="skeleton" style={{ width: 120, height: 16 }} />
+                <div className="skeleton" style={{ width: 70, height: 16 }} />
+                <div className="skeleton" style={{ flex: 1, height: 16 }} />
+                <div className="skeleton" style={{ width: 60, height: 16 }} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>账号</th>
+                <th>站点</th>
+                <th>状态</th>
+                <th>分类</th>
+                <th>信息</th>
+                <th>建议</th>
+                <th>奖励</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((log: any) => {
+                const status = getStatus(log);
+                const reason = getFailureReason(log);
+                return (
+                  <tr key={log.checkin_logs?.id || log.id}>
+                    <td style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                      {formatCheckinLogTime(log.checkin_logs?.createdAt || log.createdAt)}
+                    </td>
+                    <td style={{ fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                      {log.accounts?.username || '未知'}
+                    </td>
+                    <td>
+                      {log.sites?.url ? (
+                        <a
+                          href={log.sites.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="badge-link"
+                        >
+                          <span className="badge badge-muted" style={{ fontSize: 11 }}>
+                            {log.sites?.name || '-'}
+                          </span>
+                        </a>
+                      ) : (
+                        <span className="badge badge-muted" style={{ fontSize: 11 }}>
+                          {log.sites?.name || '-'}
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      <span className={`badge ${statusClass(status)}`}>{statusLabel(status)}</span>
+                    </td>
+                    <td>
+                      {reason ? (
+                        <span className="badge badge-info" title={reason.detailHint}>
+                          {reason.title}
+                        </span>
+                      ) : (
+                        <span className="badge badge-muted">-</span>
+                      )}
+                    </td>
+                    <td style={{ maxWidth: 360 }}>
+                      <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {log.checkin_logs?.message || log.message}
+                      </span>
+                    </td>
+                    <td style={{ maxWidth: 220 }}>
+                      <span
+                        style={{
+                          display: 'block',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          color: 'var(--color-text-secondary)',
+                          fontSize: 12,
+                        }}
+                        title={reason?.detailHint || ''}
+                      >
+                        {reason?.actionHint || '-'}
+                      </span>
+                    </td>
+                    <td>{log.checkin_logs?.reward || '-'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+
+        {!loading && filtered.length === 0 && (
+          <div className="empty-state">
+            <svg className="empty-state-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div className="empty-state-title">暂无签到记录</div>
+            <div className="empty-state-desc">点击“运行所有签到”开始执行</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

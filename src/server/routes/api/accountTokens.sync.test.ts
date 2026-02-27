@@ -1,0 +1,378 @@
+import Fastify, { type FastifyInstance } from 'fastify';
+import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { and, eq, sql } from 'drizzle-orm';
+
+const getApiTokensMock = vi.fn();
+const getApiTokenMock = vi.fn();
+const createApiTokenMock = vi.fn();
+const getUserGroupsMock = vi.fn();
+const deleteApiTokenMock = vi.fn();
+
+vi.mock('../../services/platforms/index.js', () => ({
+  getAdapter: () => ({
+    getApiTokens: (...args: unknown[]) => getApiTokensMock(...args),
+    getApiToken: (...args: unknown[]) => getApiTokenMock(...args),
+    createApiToken: (...args: unknown[]) => createApiTokenMock(...args),
+    getUserGroups: (...args: unknown[]) => getUserGroupsMock(...args),
+    deleteApiToken: (...args: unknown[]) => deleteApiTokenMock(...args),
+  }),
+}));
+
+type DbModule = typeof import('../../db/index.js');
+
+describe('account tokens sync routes with site status', () => {
+  let app: FastifyInstance;
+  let db: DbModule['db'];
+  let schema: DbModule['schema'];
+  let dataDir = '';
+  let seedId = 0;
+
+  const nextSeed = () => {
+    seedId += 1;
+    return seedId;
+  };
+
+  const seedAccount = (input: { siteStatus?: 'active' | 'disabled'; accountStatus?: string; accessToken?: string | null }) => {
+    const id = nextSeed();
+    const site = db.insert(schema.sites).values({
+      name: `site-${id}`,
+      url: `https://site-${id}.example.com`,
+      platform: 'new-api',
+    }).returning().get();
+    if (input.siteStatus === 'disabled') {
+      db.run(sql`update sites set status = 'disabled' where id = ${site.id}`);
+    }
+
+    const account = db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: `user-${id}`,
+      accessToken: input.accessToken ?? `access-token-${id}`,
+      status: input.accountStatus ?? 'active',
+    }).returning().get();
+
+    return { site, account };
+  };
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'metapi-account-tokens-sync-'));
+    process.env.DATA_DIR = dataDir;
+
+    await import('../../db/migrate.js');
+    const dbModule = await import('../../db/index.js');
+    const routesModule = await import('./accountTokens.js');
+    db = dbModule.db;
+    schema = dbModule.schema;
+
+    app = Fastify();
+    await app.register(routesModule.accountTokensRoutes);
+  });
+
+  beforeEach(() => {
+    getApiTokensMock.mockReset();
+    getApiTokenMock.mockReset();
+    createApiTokenMock.mockReset();
+    getUserGroupsMock.mockReset();
+    deleteApiTokenMock.mockReset();
+    seedId = 0;
+
+    db.delete(schema.accountTokens).run();
+    db.delete(schema.routeChannels).run();
+    db.delete(schema.tokenRoutes).run();
+    db.delete(schema.tokenModelAvailability).run();
+    db.delete(schema.modelAvailability).run();
+    db.delete(schema.checkinLogs).run();
+    db.delete(schema.accounts).run();
+    db.delete(schema.sites).run();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    delete process.env.DATA_DIR;
+  });
+
+  it('returns skipped for single-account sync when site is disabled', async () => {
+    const { account } = seedAccount({ siteStatus: 'disabled' });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: false,
+      status: 'skipped',
+      reason: 'site_disabled',
+    });
+    expect(getApiTokensMock).not.toHaveBeenCalled();
+    expect(getApiTokenMock).not.toHaveBeenCalled();
+  });
+
+  it('returns skipped when upstream has no api tokens', async () => {
+    const { account } = seedAccount({ siteStatus: 'active' });
+    getApiTokensMock.mockResolvedValue([]);
+    getApiTokenMock.mockResolvedValue(null);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/account-tokens/sync/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      synced: false,
+      status: 'skipped',
+      reason: 'no_upstream_tokens',
+    });
+
+    const tokenRows = db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+    expect(tokenRows.length).toBe(0);
+  });
+
+  it('sync-all skips disabled-site accounts and syncs active-site accounts', async () => {
+    const disabled = seedAccount({ siteStatus: 'disabled' });
+    const active = seedAccount({ siteStatus: 'active' });
+
+    getApiTokensMock.mockResolvedValue([
+      { name: 'default', key: 'sk-synced-token', enabled: true },
+    ]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens/sync-all',
+      payload: { wait: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json() as {
+      success: boolean;
+      summary: {
+        total: number;
+        synced: number;
+        skipped: number;
+        failed: number;
+      };
+      results: Array<{ accountId: number; status: string; reason?: string; synced?: boolean }>;
+    };
+
+    expect(body.success).toBe(true);
+    expect(body.summary).toMatchObject({
+      total: 2,
+      synced: 1,
+      skipped: 1,
+      failed: 0,
+    });
+
+    const skipped = body.results.find((item) => item.accountId === disabled.account.id);
+    const synced = body.results.find((item) => item.accountId === active.account.id);
+
+    expect(skipped).toMatchObject({
+      accountId: disabled.account.id,
+      status: 'skipped',
+      reason: 'site_disabled',
+    });
+    expect(synced).toMatchObject({
+      accountId: active.account.id,
+      status: 'synced',
+      synced: true,
+    });
+
+    const syncedDefaultToken = db.select()
+      .from(schema.accountTokens)
+      .where(and(eq(schema.accountTokens.accountId, active.account.id), eq(schema.accountTokens.isDefault, true)))
+      .get();
+    expect(syncedDefaultToken?.token).toBe('sk-synced-token');
+  });
+
+  it('creates token via upstream api and syncs into local store when manual token is omitted', async () => {
+    const { account, site } = seedAccount({ siteStatus: 'active' });
+    createApiTokenMock.mockResolvedValue(true);
+    getApiTokensMock.mockResolvedValue([
+      { name: 'created-from-upstream', key: 'sk-created-upstream-token', enabled: true },
+    ]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens',
+      payload: {
+        accountId: account.id,
+        name: 'created-from-upstream',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      createdViaUpstream: true,
+      synced: true,
+      status: 'synced',
+    });
+    expect(createApiTokenMock).toHaveBeenCalledTimes(1);
+    expect(createApiTokenMock.mock.calls[0][0]).toBe(site.url);
+    expect(createApiTokenMock.mock.calls[0][1]).toBe(account.accessToken);
+
+    const tokenRows = db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, account.id))
+      .all();
+
+    expect(tokenRows.length).toBe(1);
+    expect(tokenRows[0].name).toBe('created-from-upstream');
+    expect(tokenRows[0].token).toBe('sk-created-upstream-token');
+    expect(tokenRows[0].source).toBe('sync');
+  });
+
+  it('passes token creation options to upstream adapter', async () => {
+    const { account } = seedAccount({ siteStatus: 'active' });
+    createApiTokenMock.mockResolvedValue(true);
+    getApiTokensMock.mockResolvedValue([
+      { name: 'custom-token', key: 'sk-created-upstream-token', enabled: true },
+    ]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens',
+      payload: {
+        accountId: account.id,
+        name: 'custom-token',
+        group: 'vip',
+        unlimitedQuota: false,
+        remainQuota: 123456,
+        expiredTime: 2_000_000_000,
+        allowIps: '1.1.1.1,2.2.2.2',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(createApiTokenMock).toHaveBeenCalledTimes(1);
+    expect(createApiTokenMock.mock.calls[0][3]).toMatchObject({
+      name: 'custom-token',
+      group: 'vip',
+      unlimitedQuota: false,
+      remainQuota: 123456,
+      expiredTime: 2_000_000_000,
+      allowIps: '1.1.1.1,2.2.2.2',
+    });
+  });
+
+  it('returns 400 when limited token misses remainQuota', async () => {
+    const { account } = seedAccount({ siteStatus: 'active' });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens',
+      payload: {
+        accountId: account.id,
+        name: 'bad-token',
+        unlimitedQuota: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      success: false,
+      message: '有限额度令牌必须填写 remainQuota',
+    });
+    expect(createApiTokenMock).not.toHaveBeenCalled();
+  });
+
+  it('returns 502 when upstream token creation fails', async () => {
+    const { account } = seedAccount({ siteStatus: 'active' });
+    createApiTokenMock.mockResolvedValue(false);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/account-tokens',
+      payload: {
+        accountId: account.id,
+        name: 'created-from-upstream',
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      success: false,
+      message: '站点创建令牌失败',
+    });
+  });
+
+  it('fetches account token groups from upstream', async () => {
+    const { account } = seedAccount({ siteStatus: 'active' });
+    getUserGroupsMock.mockResolvedValue(['default', 'vip']);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/account-tokens/groups/${account.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      success: true,
+      groups: ['default', 'vip'],
+    });
+    expect(getUserGroupsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes upstream token before removing local token', async () => {
+    const { account, site } = seedAccount({ siteStatus: 'active' });
+    const token = db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'upstream-token',
+      token: 'sk-upstream-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: false,
+    }).returning().get();
+    deleteApiTokenMock.mockResolvedValue(true);
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/api/account-tokens/${token.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(deleteApiTokenMock).toHaveBeenCalledTimes(1);
+    expect(deleteApiTokenMock.mock.calls[0][0]).toBe(site.url);
+    expect(deleteApiTokenMock.mock.calls[0][1]).toBe(account.accessToken);
+    expect(deleteApiTokenMock.mock.calls[0][2]).toBe('sk-upstream-token');
+
+    const removed = db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
+    expect(removed).toBeUndefined();
+  });
+
+  it('keeps local token when upstream deletion fails', async () => {
+    const { account } = seedAccount({ siteStatus: 'active' });
+    const token = db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'upstream-token',
+      token: 'sk-upstream-token',
+      source: 'sync',
+      enabled: true,
+      isDefault: false,
+    }).returning().get();
+    deleteApiTokenMock.mockResolvedValue(false);
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/api/account-tokens/${token.id}`,
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      success: false,
+      message: '站点删除令牌失败，本地未删除',
+    });
+
+    const existing = db.select().from(schema.accountTokens).where(eq(schema.accountTokens.id, token.id)).get();
+    expect(existing).toBeDefined();
+  });
+});

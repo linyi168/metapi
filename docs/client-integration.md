@@ -1,0 +1,127 @@
+# 🔌 客户端接入
+
+本文档说明如何将下游客户端连接到 Metapi 代理网关。
+
+[返回文档中心](./README.md)
+
+---
+
+## 通用配置
+
+Metapi 暴露标准 OpenAI / Claude 兼容接口，下游客户端只需配置两项：
+
+| 配置项 | 值 |
+|--------|-----|
+| **Base URL** | `https://your-domain.com`（不要拼接 `/v1`，客户端会自动加） |
+| **API Key** | 你设置的 `PROXY_TOKEN` 值 |
+
+模型列表自动从 `GET /v1/models` 获取，无需手动配置。
+
+## 支持的接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/v1/chat/completions` | POST | OpenAI Chat Completions |
+| `/v1/messages` | POST | Claude Messages |
+| `/v1/completions` | POST | OpenAI Completions（Legacy） |
+| `/v1/embeddings` | POST | 向量嵌入 |
+| `/v1/images/generations` | POST | 图像生成 |
+| `/v1/models` | GET | 模型列表 |
+
+## 已验证兼容的客户端
+
+### ChatGPT-Next-Web
+
+| 配置项 | 值 |
+|--------|-----|
+| Settings → Custom Endpoint | `https://your-domain.com` |
+| API Key | `PROXY_TOKEN` |
+
+### Open WebUI
+
+| 配置项 | 值 |
+|--------|-----|
+| Settings → Connections → OpenAI API URL | `https://your-domain.com/v1` |
+| API Key | `PROXY_TOKEN` |
+
+### Cherry Studio
+
+| 配置项 | 值 |
+|--------|-----|
+| 模型提供商 → OpenAI → API 地址 | `https://your-domain.com` |
+| API Key | `PROXY_TOKEN` |
+
+### Cursor
+
+| 配置项 | 值 |
+|--------|-----|
+| Settings → Models → OpenAI API Key | `PROXY_TOKEN` |
+| Override OpenAI Base URL | `https://your-domain.com/v1` |
+
+### Claude Code
+
+```bash
+export ANTHROPIC_BASE_URL=https://your-domain.com
+export ANTHROPIC_API_KEY=your-proxy-sk-token
+```
+
+或在配置文件中设置相应的环境变量。
+
+### Roo Code / Kilo Code
+
+配置方式与 Cursor 类似，在设置中填入 Base URL 和 API Key。
+
+### 其他客户端
+
+所有支持 OpenAI API 格式的客户端均可接入，只需找到 Base URL 和 API Key 的配置位置即可。
+
+## 快速自检
+
+部署完成后，用以下命令验证链路：
+
+```bash
+# 1. 检查模型列表
+curl -sS https://your-domain.com/v1/models \
+  -H "Authorization: Bearer <PROXY_TOKEN>" | head -50
+
+# 2. 测试对话（非流式）
+curl -sS https://your-domain.com/v1/chat/completions \
+  -H "Authorization: Bearer <PROXY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+# 3. 测试流式
+curl -sS https://your-domain.com/v1/chat/completions \
+  -H "Authorization: Bearer <PROXY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+## 常见问题
+
+### 流式响应异常
+
+如果非流式正常但流式异常，原因几乎都是反向代理配置问题：
+
+1. Nginx 未设置 `proxy_buffering off`
+2. CDN 或中间层缓存了 SSE 响应
+3. 中间层改写了 `text/event-stream` Content-Type
+
+参考 [部署指南 → Nginx 配置](./deployment.md#nginx) 解决。
+
+### 模型列表为空
+
+- 检查是否已添加站点和账号
+- 检查账号是否处于 `healthy` 状态
+- 检查是否已同步 Token
+- 在管理后台手动触发「刷新模型」
+
+### 客户端提示 401 / 403
+
+- 确认使用的是 `PROXY_TOKEN` 而非 `AUTH_TOKEN`
+- 确认反向代理透传了 `Authorization` 请求头
+
+## 下一步
+
+- [配置说明](./configuration.md) — 环境变量详解
+- [常见问题](./faq.md) — 更多故障排查

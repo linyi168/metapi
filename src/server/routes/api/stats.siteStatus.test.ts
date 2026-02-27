@@ -1,0 +1,156 @@
+import Fastify, { type FastifyInstance } from 'fastify';
+import { describe, expect, it, beforeAll, beforeEach, afterAll } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { sql } from 'drizzle-orm';
+import { formatLocalDate } from '../../services/localTimeService.js';
+
+type DbModule = typeof import('../../db/index.js');
+
+describe('stats dashboard filters disabled sites', () => {
+  let app: FastifyInstance;
+  let db: DbModule['db'];
+  let schema: DbModule['schema'];
+  let dataDir = '';
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'metapi-stats-site-status-'));
+    process.env.DATA_DIR = dataDir;
+
+    await import('../../db/migrate.js');
+    const dbModule = await import('../../db/index.js');
+    const routesModule = await import('./stats.js');
+    db = dbModule.db;
+    schema = dbModule.schema;
+
+    app = Fastify();
+    await app.register(routesModule.statsRoutes);
+  });
+
+  beforeEach(() => {
+    db.delete(schema.proxyLogs).run();
+    db.delete(schema.checkinLogs).run();
+    db.delete(schema.routeChannels).run();
+    db.delete(schema.tokenRoutes).run();
+    db.delete(schema.tokenModelAvailability).run();
+    db.delete(schema.modelAvailability).run();
+    db.delete(schema.accountTokens).run();
+    db.delete(schema.accounts).run();
+    db.delete(schema.sites).run();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    delete process.env.DATA_DIR;
+  });
+
+  it('excludes disabled-site balances from dashboard totals', async () => {
+    const activeSite = db.insert(schema.sites).values({
+      name: 'active-site',
+      url: 'https://active-site.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const disabledSite = db.insert(schema.sites).values({
+      name: 'disabled-site',
+      url: 'https://disabled-site.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    db.run(sql`update sites set status = 'disabled' where id = ${disabledSite.id}`);
+
+    db.insert(schema.accounts).values({
+      siteId: activeSite.id,
+      username: 'active-user',
+      accessToken: 'active-token',
+      balance: 100,
+      status: 'active',
+    }).run();
+
+    db.insert(schema.accounts).values({
+      siteId: disabledSite.id,
+      username: 'disabled-user',
+      accessToken: 'disabled-token',
+      balance: 900,
+      status: 'active',
+    }).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/stats/dashboard',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      totalBalance: number;
+      activeAccounts: number;
+      totalAccounts: number;
+    };
+
+    expect(body.totalBalance).toBe(100);
+    expect(body.activeAccounts).toBe(1);
+    expect(body.totalAccounts).toBe(1);
+  });
+
+  it('treats skipped checkins as successful in dashboard stats', async () => {
+    const today = formatLocalDate(new Date());
+    const site = db.insert(schema.sites).values({
+      name: 'checkin-site',
+      url: 'https://checkin-site.example.com',
+      platform: 'new-api',
+    }).returning().get();
+
+    const account = db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'checkin-user',
+      accessToken: 'token',
+      balance: 10,
+      status: 'active',
+    }).returning().get();
+
+    db.insert(schema.checkinLogs).values([
+      {
+        accountId: account.id,
+        status: 'success',
+        message: 'checked in',
+        reward: '1',
+        createdAt: `${today} 09:00:00`,
+      },
+      {
+        accountId: account.id,
+        status: 'skipped',
+        message: 'today already checked in',
+        reward: '',
+        createdAt: `${today} 09:10:00`,
+      },
+      {
+        accountId: account.id,
+        status: 'failed',
+        message: 'checkin failed',
+        reward: '',
+        createdAt: `${today} 09:20:00`,
+      },
+    ]).run();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/stats/dashboard',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      todayCheckin: {
+        success: number;
+        failed: number;
+        total: number;
+      };
+    };
+
+    expect(body.todayCheckin).toEqual({
+      success: 2,
+      failed: 1,
+      total: 3,
+    });
+  });
+});

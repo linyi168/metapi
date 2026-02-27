@@ -1,0 +1,391 @@
+import { db, schema } from '../db/index.js';
+import { getAdapter } from './platforms/index.js';
+import { eq } from 'drizzle-orm';
+import { sendNotification } from './notifyService.js';
+import { isTokenExpiredError } from './alertRules.js';
+import { reportTokenExpired } from './alertService.js';
+import { getAutoReloginConfig, resolvePlatformUserId } from './accountExtraConfig.js';
+import { decryptAccountPassword } from './accountCredentialService.js';
+import { extractRuntimeHealth, setAccountRuntimeHealth } from './accountHealthService.js';
+import { updateTodayIncomeSnapshot } from './todayIncomeRewardService.js';
+import type { BalanceInfo } from './platforms/base.js';
+
+function isSiteDisabled(status?: string | null): boolean {
+  return (status || 'active') === 'disabled';
+}
+
+function shouldAttemptAutoRelogin(message?: string | null): boolean {
+  if (!message) return false;
+  if (isTokenExpiredError({ message })) return true;
+
+  const text = message.toLowerCase();
+  return (
+    text.includes('access token') ||
+    text.includes('new-api-user') ||
+    text.includes('unauthorized') ||
+    text.includes('forbidden') ||
+    text.includes('not login') ||
+    text.includes('not logged')
+  );
+}
+
+function shouldReportExpired(message?: string | null): boolean {
+  if (!message) return false;
+  if (isTokenExpiredError({ message })) return true;
+
+  const text = message.toLowerCase();
+  return (
+    text.includes('access token') ||
+    text.includes('new-api-user') ||
+    text.includes('unauthorized') ||
+    text.includes('forbidden')
+  );
+}
+
+function isUnsupportedCheckinRuntimeHealth(health: ReturnType<typeof extractRuntimeHealth>): boolean {
+  if (!health || health.state !== 'degraded') return false;
+  if ((health.source || '').toLowerCase() === 'checkin') return true;
+  const reason = (health.reason || '').toLowerCase();
+  return (
+    reason.includes('checkin endpoint not found') ||
+    reason.includes('invalid url (post /api/user/checkin)') ||
+    (reason.includes('http 404') && reason.includes('/api/user/checkin')) ||
+    reason.includes('unsupported checkin endpoint')
+  );
+}
+
+const INCOME_LOG_TYPES = [1, 4] as const;
+const LOG_PAGE_SIZE = 100;
+const LOG_MAX_PAGES = 6;
+
+function supportsTodayIncomeLogFallback(platform?: string | null): boolean {
+  const normalized = (platform || '').toLowerCase();
+  return (
+    normalized === 'new-api' ||
+    normalized === 'anyrouter' ||
+    normalized === 'one-api' ||
+    normalized === 'veloera'
+  );
+}
+
+function getTodayUnixSecondsRange(now = new Date()): { start: number; end: number } {
+  const startDate = new Date(now);
+  startDate.setHours(0, 0, 0, 0);
+
+  const endDate = new Date(now);
+  endDate.setHours(23, 59, 59, 999);
+
+  return {
+    start: Math.floor(startDate.getTime() / 1000),
+    end: Math.floor(endDate.getTime() / 1000),
+  };
+}
+
+function parsePositiveNumber(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 0;
+}
+
+function parseIncomeFromContent(content: unknown): number {
+  if (typeof content !== 'string') return 0;
+  const normalized = content.replace(/,/g, '');
+  const match = normalized.match(/[-+]?\d+(?:\.\d+)?/);
+  if (!match) return 0;
+  const parsed = Number(match[0]);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return parsed;
+}
+
+function extractLogItems(payload: any): Array<{ quota?: unknown; content?: unknown }> {
+  if (Array.isArray(payload?.data?.items)) return payload.data.items;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.data)) return payload.data;
+  return [];
+}
+
+function extractLogTotal(payload: any): number | null {
+  const candidates = [payload?.data?.total, payload?.total];
+  for (const value of candidates) {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+    if (typeof value === 'string') {
+      const parsed = Number.parseInt(value.trim(), 10);
+      if (!Number.isNaN(parsed) && parsed >= 0) return parsed;
+    }
+  }
+  return null;
+}
+
+function resolveQuotaConversionFactor(platform?: string | null): number {
+  return (platform || '').toLowerCase() === 'veloera' ? 1_000_000 : 500_000;
+}
+
+async function fetchTodayIncomeFromLogs(params: {
+  baseUrl: string;
+  accessToken: string;
+  platform?: string | null;
+  platformUserId?: number;
+}): Promise<number | null> {
+  const baseUrl = params.baseUrl.trim();
+  const accessToken = params.accessToken.trim();
+  if (!baseUrl || !accessToken) return null;
+
+  const { fetch } = await import('undici');
+  const { start, end } = getTodayUnixSecondsRange();
+  const conversionFactor = resolveQuotaConversionFactor(params.platform);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+  };
+  if (typeof params.platformUserId === 'number' && Number.isFinite(params.platformUserId)) {
+    headers['New-Api-User'] = String(Math.trunc(params.platformUserId));
+  }
+
+  let hasAnyLogResponse = false;
+  let totalIncome = 0;
+
+  for (const logType of INCOME_LOG_TYPES) {
+    let page = 1;
+    while (page <= LOG_MAX_PAGES) {
+      const query = new URLSearchParams({
+        p: String(page),
+        page_size: String(LOG_PAGE_SIZE),
+        type: String(logType),
+        token_name: '',
+        model_name: '',
+        start_timestamp: String(start),
+        end_timestamp: String(end),
+        group: '',
+      });
+
+      try {
+        const response = await fetch(`${baseUrl}/api/log/self?${query.toString()}`, {
+          method: 'GET',
+          headers,
+        });
+        if (!response.ok) break;
+
+        const payload = await response.json().catch(() => null);
+        if (!payload || typeof payload !== 'object') break;
+        hasAnyLogResponse = true;
+
+        const items = extractLogItems(payload);
+        for (const item of items) {
+          const quotaRaw = parsePositiveNumber(item?.quota);
+          if (quotaRaw > 0) {
+            totalIncome += quotaRaw / conversionFactor;
+            continue;
+          }
+          totalIncome += parseIncomeFromContent(item?.content);
+        }
+
+        const total = extractLogTotal(payload);
+        if (items.length === 0) break;
+        if (total != null && page * LOG_PAGE_SIZE >= total) break;
+        page += 1;
+      } catch {
+        break;
+      }
+    }
+  }
+
+  if (!hasAnyLogResponse) return null;
+  return Math.round(totalIncome * 1_000_000) / 1_000_000;
+}
+
+async function tryAutoRelogin(account: any, site: any): Promise<string | null> {
+  const adapter = getAdapter(site.platform);
+  if (!adapter) return null;
+
+  const relogin = getAutoReloginConfig(account.extraConfig);
+  if (!relogin) return null;
+
+  const password = decryptAccountPassword(relogin.passwordCipher);
+  if (!password) return null;
+
+  const loginResult = await adapter.login(site.url, relogin.username, password);
+  if (!loginResult.success || !loginResult.accessToken) return null;
+
+  db.update(schema.accounts)
+    .set({
+      accessToken: loginResult.accessToken,
+      status: account.status === 'expired' ? 'active' : account.status,
+      updatedAt: new Date().toISOString(),
+    })
+    .where(eq(schema.accounts.id, account.id))
+    .run();
+
+  return loginResult.accessToken;
+}
+
+export async function refreshBalance(accountId: number) {
+  const rows = db
+    .select()
+    .from(schema.accounts)
+    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+    .where(eq(schema.accounts.id, accountId))
+    .all();
+
+  if (rows.length === 0) return null;
+
+  const account = rows[0].accounts;
+  const site = rows[0].sites;
+
+  if (isSiteDisabled(site.status)) {
+    setAccountRuntimeHealth(account.id, {
+      state: 'disabled',
+      reason: '站点已禁用',
+      source: 'balance',
+    });
+    return {
+      balance: account.balance ?? 0,
+      used: account.balanceUsed ?? 0,
+      quota: account.quota ?? 0,
+      skipped: true,
+      reason: 'site_disabled',
+    };
+  }
+
+  const adapter = getAdapter(site.platform);
+  if (!adapter) return null;
+
+  const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
+  let activeAccessToken = account.accessToken;
+  let balanceInfo: BalanceInfo | null = null;
+
+  const readBalance = async (token: string) => adapter.getBalance(site.url, token, platformUserId);
+  const handleBalanceError = async (err: any) => {
+    const message = err?.message || 'unknown error';
+    setAccountRuntimeHealth(account.id, {
+      state: 'unhealthy',
+      reason: message,
+      source: 'balance',
+    });
+    if (shouldReportExpired(message)) {
+      await reportTokenExpired({
+        accountId: account.id,
+        username: account.username,
+        siteName: site.name,
+        detail: message,
+      });
+    }
+    throw err;
+  };
+
+  try {
+    balanceInfo = await readBalance(activeAccessToken);
+  } catch (err: any) {
+    const message = err?.message || 'unknown error';
+    if (shouldAttemptAutoRelogin(message)) {
+      const refreshedAccessToken = await tryAutoRelogin(account, site);
+      if (refreshedAccessToken) {
+        activeAccessToken = refreshedAccessToken;
+        try {
+          balanceInfo = await readBalance(activeAccessToken);
+        } catch (retryErr: any) {
+          await handleBalanceError(retryErr);
+        }
+      } else {
+        await handleBalanceError(err);
+      }
+    } else {
+      await handleBalanceError(err);
+    }
+  }
+
+  if (!balanceInfo) {
+    throw new Error('failed to fetch balance');
+  }
+
+  if (
+    !(typeof balanceInfo.todayIncome === 'number' && Number.isFinite(balanceInfo.todayIncome)) &&
+    supportsTodayIncomeLogFallback(site.platform)
+  ) {
+    try {
+      const fallbackIncome = await fetchTodayIncomeFromLogs({
+        baseUrl: site.url,
+        accessToken: activeAccessToken,
+        platform: site.platform,
+        platformUserId,
+      });
+      if (typeof fallbackIncome === 'number' && Number.isFinite(fallbackIncome)) {
+        balanceInfo.todayIncome = fallbackIncome;
+      }
+    } catch {}
+  }
+
+  const existingRuntimeHealth = extractRuntimeHealth(account.extraConfig);
+  const keepUnsupportedCheckinDegraded = isUnsupportedCheckinRuntimeHealth(existingRuntimeHealth);
+
+  const updates: Record<string, unknown> = {
+    balance: balanceInfo.balance,
+    balanceUsed: balanceInfo.used,
+    quota: balanceInfo.quota,
+    status: account.status === 'expired' ? 'active' : account.status,
+    lastBalanceRefresh: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  if (typeof balanceInfo.todayIncome === 'number' && Number.isFinite(balanceInfo.todayIncome)) {
+    updates.extraConfig = updateTodayIncomeSnapshot(account.extraConfig, balanceInfo.todayIncome);
+  }
+
+  db.update(schema.accounts)
+    .set(updates)
+    .where(eq(schema.accounts.id, accountId))
+    .run();
+
+  setAccountRuntimeHealth(account.id, {
+    state: keepUnsupportedCheckinDegraded ? 'degraded' : 'healthy',
+    reason: keepUnsupportedCheckinDegraded
+      ? (existingRuntimeHealth?.reason || '\u7ad9\u70b9\u4e0d\u652f\u6301\u7b7e\u5230\u63a5\u53e3')
+      : '\u4f59\u989d\u5237\u65b0\u6210\u529f',
+    source: keepUnsupportedCheckinDegraded
+      ? (existingRuntimeHealth?.source || 'checkin')
+      : 'balance',
+  });
+
+  if (balanceInfo.balance < 1) {
+    db.insert(schema.events).values({
+      type: 'balance',
+      title: '余额不足',
+      message: `${account.username || 'ID:' + accountId} 余额不足: $${balanceInfo.balance.toFixed(2)}`,
+      level: 'warning',
+      relatedId: accountId,
+      relatedType: 'account',
+    }).run();
+
+    await sendNotification(
+      '余额不足提醒',
+      `${account.username || 'ID:' + accountId} 余额不足: $${balanceInfo.balance.toFixed(2)}`,
+      'warning',
+    );
+  }
+
+  return balanceInfo;
+}
+
+export async function refreshAllBalances() {
+  const rows = db
+    .select()
+    .from(schema.accounts)
+    .where(eq(schema.accounts.status, 'active'))
+    .all();
+
+  const results: Array<{ accountId: number; balance: number | null }> = [];
+
+  await Promise.all(
+    rows.map(async (account) => {
+      try {
+        const info = await refreshBalance(account.id);
+        results.push({ accountId: account.id, balance: info?.balance ?? null });
+      } catch {
+        results.push({ accountId: account.id, balance: null });
+      }
+    }),
+  );
+
+  return results;
+}

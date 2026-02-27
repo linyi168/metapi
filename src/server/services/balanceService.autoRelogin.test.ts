@@ -1,0 +1,267 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const adapterMock = {
+  getBalance: vi.fn(),
+  login: vi.fn(),
+};
+
+const selectAllMock = vi.fn();
+const updateSetMock = vi.fn();
+const insertValuesMock = vi.fn();
+const reportTokenExpiredMock = vi.fn();
+const sendNotificationMock = vi.fn();
+const decryptPasswordMock = vi.fn();
+const setAccountRuntimeHealthMock = vi.fn();
+const extractRuntimeHealthMock = vi.fn();
+const undiciFetchMock = vi.fn();
+
+vi.mock('../db/index.js', () => {
+  const selectChain = {
+    all: () => selectAllMock(),
+    where: () => selectChain,
+    innerJoin: () => selectChain,
+    from: () => selectChain,
+  };
+
+  const updateWhereChain = {
+    run: () => ({}),
+  };
+
+  const updateSetChain = {
+    where: () => updateWhereChain,
+  };
+
+  const insertChain = {
+    run: () => ({}),
+    values: (...args: unknown[]) => {
+      insertValuesMock(...args);
+      return insertChain;
+    },
+  };
+
+  return {
+    db: {
+      select: () => selectChain,
+      update: () => ({
+        set: (updates: Record<string, unknown>) => {
+          updateSetMock(updates);
+          return updateSetChain;
+        },
+      }),
+      insert: () => insertChain,
+    },
+    schema: {
+      accounts: { id: 'id', siteId: 'siteId', status: 'status' },
+      sites: { id: 'id' },
+      events: {},
+    },
+  };
+});
+
+vi.mock('./platforms/index.js', () => ({
+  getAdapter: () => adapterMock,
+}));
+
+vi.mock('./alertService.js', () => ({
+  reportTokenExpired: (...args: unknown[]) => reportTokenExpiredMock(...args),
+}));
+
+vi.mock('./notifyService.js', () => ({
+  sendNotification: (...args: unknown[]) => sendNotificationMock(...args),
+}));
+
+vi.mock('./accountCredentialService.js', () => ({
+  decryptAccountPassword: (...args: unknown[]) => decryptPasswordMock(...args),
+}));
+
+vi.mock('./accountHealthService.js', () => ({
+  setAccountRuntimeHealth: (...args: unknown[]) => setAccountRuntimeHealthMock(...args),
+  extractRuntimeHealth: (...args: unknown[]) => extractRuntimeHealthMock(...args),
+}));
+
+vi.mock('undici', () => ({
+  fetch: (...args: unknown[]) => undiciFetchMock(...args),
+}));
+
+describe('balanceService auto relogin', () => {
+  beforeEach(() => {
+    adapterMock.getBalance.mockReset();
+    adapterMock.login.mockReset();
+    selectAllMock.mockReset();
+    updateSetMock.mockReset();
+    insertValuesMock.mockReset();
+    reportTokenExpiredMock.mockReset();
+    sendNotificationMock.mockReset();
+    decryptPasswordMock.mockReset();
+    setAccountRuntimeHealthMock.mockReset();
+    extractRuntimeHealthMock.mockReset();
+    undiciFetchMock.mockReset();
+
+    extractRuntimeHealthMock.mockReturnValue(null);
+    undiciFetchMock.mockResolvedValue({
+      ok: false,
+      json: async () => ({}),
+    });
+  });
+
+  it('retries balance fetch once after successful auto relogin', async () => {
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 1,
+          username: 'linuxdo_11494',
+          accessToken: 'stale-token',
+          status: 'active',
+          extraConfig: JSON.stringify({
+            platformUserId: 11494,
+            autoRelogin: { username: 'linuxdo_11494', passwordCipher: 'cipher' },
+          }),
+        },
+        sites: {
+          id: 3,
+          name: 'wong',
+          url: 'https://wzw.pp.ua',
+          platform: 'new-api',
+        },
+      },
+    ]);
+
+    adapterMock.getBalance
+      .mockRejectedValueOnce(new Error('HTTP 401: access token required'))
+      .mockResolvedValueOnce({ balance: 12, used: 1, quota: 13 });
+    decryptPasswordMock.mockReturnValue('plain-password');
+    adapterMock.login.mockResolvedValue({ success: true, accessToken: 'fresh-token' });
+
+    const { refreshBalance } = await import('./balanceService.js');
+    const result = await refreshBalance(1);
+
+    expect(result).toEqual({ balance: 12, used: 1, quota: 13 });
+    expect(adapterMock.login).toHaveBeenCalledTimes(1);
+    expect(adapterMock.getBalance).toHaveBeenCalledTimes(2);
+    expect(adapterMock.getBalance.mock.calls[0][1]).toBe('stale-token');
+    expect(adapterMock.getBalance.mock.calls[1][1]).toBe('fresh-token');
+    expect(updateSetMock.mock.calls.some((call) => call[0]?.accessToken === 'fresh-token')).toBe(true);
+    expect(reportTokenExpiredMock).not.toHaveBeenCalled();
+  });
+
+  it('reports token expired when relogin is unavailable', async () => {
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 2,
+          username: 'linuxdo_7659',
+          accessToken: 'stale-token',
+          status: 'active',
+          extraConfig: null,
+        },
+        sites: {
+          id: 4,
+          name: 'kfc',
+          url: 'https://kfc-api.sxxe.net',
+          platform: 'new-api',
+        },
+      },
+    ]);
+
+    adapterMock.getBalance.mockRejectedValueOnce(new Error('HTTP 401: access token required'));
+
+    const { refreshBalance } = await import('./balanceService.js');
+    await expect(refreshBalance(2)).rejects.toThrow('access token');
+
+    expect(adapterMock.login).not.toHaveBeenCalled();
+    expect(reportTokenExpiredMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps degraded health when checkin is unsupported but balance refresh succeeds', async () => {
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 3,
+          username: 'ld6jl3djexjf',
+          accessToken: 'active-token',
+          status: 'active',
+          extraConfig: JSON.stringify({
+            runtimeHealth: {
+              state: 'degraded',
+              reason: 'checkin endpoint not found',
+              source: 'checkin',
+            },
+          }),
+        },
+        sites: {
+          id: 5,
+          name: 'Wind Hub',
+          url: 'https://windhub.cc',
+          platform: 'done-hub',
+        },
+      },
+    ]);
+
+    adapterMock.getBalance.mockResolvedValueOnce({ balance: 100, used: 2, quota: 102 });
+    extractRuntimeHealthMock.mockReturnValue({
+      state: 'degraded',
+      reason: 'checkin endpoint not found',
+      source: 'checkin',
+      checkedAt: '2026-02-25T12:00:00.000Z',
+    });
+
+    const { refreshBalance } = await import('./balanceService.js');
+    const result = await refreshBalance(3);
+
+    expect(result).toEqual({ balance: 100, used: 2, quota: 102 });
+    expect(setAccountRuntimeHealthMock).toHaveBeenCalledWith(
+      3,
+      expect.objectContaining({
+        state: 'degraded',
+        reason: 'checkin endpoint not found',
+      }),
+    );
+  });
+
+  it('fills today income snapshot from log endpoint when balance api lacks today_income', async () => {
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 4,
+          username: 'linuxdo_7659',
+          accessToken: 'active-token',
+          status: 'active',
+          extraConfig: null,
+        },
+        sites: {
+          id: 6,
+          name: 'kfc',
+          url: 'https://kfc-api.sxxe.net',
+          platform: 'new-api',
+        },
+      },
+    ]);
+
+    adapterMock.getBalance.mockResolvedValueOnce({ balance: 12, used: 1, quota: 13 });
+    undiciFetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ data: { items: [], total: 0 } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: {
+            items: [{ quota: 0, content: '签到奖励 2.083650 额度' }],
+            total: 1,
+          },
+        }),
+      });
+
+    const { refreshBalance } = await import('./balanceService.js');
+    const result = await refreshBalance(4);
+
+    expect(result).toEqual({ balance: 12, used: 1, quota: 13, todayIncome: 2.08365 });
+    const updateWithSnapshot = updateSetMock.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((payload) => typeof payload.extraConfig === 'string');
+    expect(updateWithSnapshot).toBeDefined();
+    const parsedExtra = JSON.parse(String(updateWithSnapshot?.extraConfig));
+    expect(parsedExtra.todayIncomeSnapshot?.latest).toBeCloseTo(2.08365, 6);
+  });
+});
